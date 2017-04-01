@@ -1,0 +1,13 @@
+[package]
+name = "s3hfs"
+version = "0.1.0"
+authors = ["Alister Lee <alister@dev.shortepic.com>"]
+
+[dependencies]
+log = "0.3.7"
+env_logger = "0.4.2"
+error-chain = "0.10.0"
+clap = "2.21.1"
+libc = "0.2.21"
+time = "0.1.36"
+fuse = "0.3.0"
