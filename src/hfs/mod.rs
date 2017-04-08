@@ -105,21 +105,20 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
 
         if ino == 1 {
             if offset == 0 {
-                reply.add(1, 0, fuse::FileType::Directory, ".");
-                reply.add(1, 1, fuse::FileType::Directory, "..");
+                reply.add(1, 0, fuse::FileType::RegularFile, "sandwich.txt");
             }
-            for (i, entry) in std::fs::read_dir(self.backingpath).unwrap().enumerate() {
-                if (i as u64) < offset {
-                    continue;
-                };
-                let entry = entry.unwrap();
-                if reply.add(entry.ino(),
-                             (i + 2) as u64,
-                             filetype_tryfrom(&entry.file_type().unwrap()).unwrap(),
-                             entry.file_name()) {
-                    break;
-                };
-            }
+            // for (i, entry) in std::fs::read_dir(self.backingpath).unwrap().enumerate() {
+            //     if (i as u64) < offset {
+            //         continue;
+            //     };
+            //     let entry = entry.unwrap();
+            //     if reply.add(entry.ino(),
+            //                  (i + 2) as u64,
+            //                  filetype_tryfrom(&entry.file_type().unwrap()).unwrap(),
+            //                  entry.file_name()) {
+            //         break;
+            //     };
+            // }
             reply.ok();
         } else {
             reply.error(ENOENT);
