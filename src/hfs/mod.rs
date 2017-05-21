@@ -1,14 +1,16 @@
 use super::errors::*;
 
 use fuse;
-use fuse::{Filesystem, Request, ReplyAttr, ReplyDirectory, FileAttr};
+use fuse::{Filesystem, Request, ReplyAttr, ReplyDirectory, ReplyEntry, FileAttr};
 
 use libc::{ENOSYS, ENOENT};
 
 use time::Timespec;
 use std;
+use std::ffi::OsStr;
 use std::fs;
 use std::time::SystemTime;
+use std::path::Path;
 
 pub struct S3HierarchicalFilesystem<'a> {
     mountpath: &'a str,
@@ -86,10 +88,42 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                     reply.error(ENOSYS);
                 }
             }
-            Err(_) => {
-                reply.error(ENOSYS);
+            Err(e) => {
+                debug!("{:?}", e);
+                reply.error(ENOENT);
             }
         };
+    }
+
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        info!("lookup(parent={}, name={:?})", parent, name);
+        if parent == 1 {
+            let name = match name.to_str() {
+                Some(s) => s,
+                None => {
+                    error!("extracting name for lookup");
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+            let path = vec![self.backingpath.to_string(), name.to_string()].join("/");
+            match std::fs::metadata(path) {
+                Ok(metadata) => {
+                    debug!("{:?}", metadata);
+                    let attr = fileattr_from(&metadata);
+                    let ttl = Timespec::new(1, 0);
+                    debug!("warning: generation assumed 0");
+                    reply.entry(&ttl, &attr, 0);
+                    debug!("{:?}", attr);
+                }
+                Err(e) => {
+                    error!("{}: \"{}\"", e, name);
+                    reply.error(ENOENT);
+                }
+            };
+        } else {
+            reply.error(ENOSYS)
+        }
     }
 
     fn readdir(&mut self,
@@ -105,23 +139,38 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
 
         if ino == 1 {
             if offset == 0 {
-                reply.add(1, 0, fuse::FileType::RegularFile, "sandwich.txt");
+                reply.add(1, 0, fuse::FileType::Directory, ".");
+                reply.add(1, 1, fuse::FileType::Directory, "..");
             }
-            // for (i, entry) in std::fs::read_dir(self.backingpath).unwrap().enumerate() {
-            //     if (i as u64) < offset {
-            //         continue;
-            //     };
-            //     let entry = entry.unwrap();
-            //     if reply.add(entry.ino(),
-            //                  (i + 2) as u64,
-            //                  filetype_tryfrom(&entry.file_type().unwrap()).unwrap(),
-            //                  entry.file_name()) {
-            //         break;
-            //     };
-            // }
+
+            let rd = match fs::read_dir(self.backingpath) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    error!("{:?}", e);
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+
+            for (i, entry_opt) in rd.enumerate() {
+                debug!("Found entry {}: {:?}", i, entry_opt);
+                if (i as u64) < offset {
+                    continue;
+                };
+                if let Ok(entry) = entry_opt {
+                    if let Ok(ft) = entry.file_type() {
+                        if let Ok(filetype) = filetype_tryfrom(&ft) {
+                            debug!("adding entry");
+                            if reply.add(entry.ino(), (i + 2) as u64, filetype, entry.file_name()) {
+                                break;
+                            }
+                        }
+                    }
+                };
+            }
             reply.ok();
         } else {
-            reply.error(ENOENT);
+            reply.error(ENOSYS);
         }
     }
 }

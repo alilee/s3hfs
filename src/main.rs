@@ -55,10 +55,12 @@ fn run() -> Result<()> {
         .author("Alister Lee <dev@shortepic.com>")
         .about("AWS S3-backed infinitely-expandable mountable filesystem.")
         .arg(Arg::with_name("MOUNTPATH")
-            .required(true)
+            .default_value("/tmp/fs")
+            // .required(true)
             .help("path to mount the filesystem at"))
         .arg(Arg::with_name("BACKINGPATH")
-            .required(true)
+            .default_value("/tmp/back")
+            // .required(true)
             .help("path where underlying files will be "));
 
     let cmdline = app.get_matches();
