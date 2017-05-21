@@ -13,16 +13,19 @@ use std::time::SystemTime;
 use std::path::Path;
 
 pub struct S3HierarchicalFilesystem<'a> {
-    mountpath: &'a str,
-    backingpath: &'a str,
+    mount_path: &'a str,
+    backing_path: &'a str,
+    ino_paths: std::collections::HashMap<u64, String>,
 }
 
 impl<'a> S3HierarchicalFilesystem<'a> {
     pub fn mount(mp: &str, bp: &str) -> Result<()> {
-        let fs = S3HierarchicalFilesystem {
-            mountpath: mp,
-            backingpath: bp,
+        let mut fs = S3HierarchicalFilesystem {
+            mount_path: mp,
+            backing_path: bp,
+            ino_paths: std::collections::HashMap::new(),
         };
+        fs.ino_paths.insert(1, bp.to_string());
         fuse::mount(fs, &mp, &[]).chain_err(|| "mounting filesystem")
     }
 }
@@ -73,57 +76,76 @@ fn fileattr_from(m: &std::fs::Metadata) -> FileAttr {
     }
 }
 
+macro_rules! unwrap_or_return_error {
+    ($v:expr, $log:expr, $err:expr, $reply:ident) => (
+        match $v {
+            Some(v) => v,
+            None => {
+                error!($log);
+                $reply.error($err);
+                return;
+            }
+        }
+    )
+}
+
+macro_rules! ok_or_return_error {
+    ($v:expr, $err:expr, $reply:ident) => (
+        match $v {
+            Ok(v) => v,
+            Err(e) => {
+                error!("{:?}", e);
+                $reply.error($err);
+                return;
+            }
+        }
+    )
+}
+
 impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         info!("getattr(ino={})", ino);
-        match std::fs::metadata(self.backingpath) {
-            Ok(metadata) => {
-                debug!("{:?}", metadata);
-                let attr = fileattr_from(&metadata);
-                if ino == 1 {
-                    let ttl = Timespec::new(1, 0);
-                    reply.attr(&ttl, &attr);
-                    debug!("{:?}", attr);
-                } else {
-                    reply.error(ENOSYS);
-                }
-            }
-            Err(e) => {
-                debug!("{:?}", e);
-                reply.error(ENOENT);
-            }
-        };
+        debug!("req: {:?}", _req);
+
+        let path = unwrap_or_return_error!(self.ino_paths.get(&ino),
+                                           "ino not found in cache",
+                                           ENOENT,
+                                           reply);
+        let metadata = ok_or_return_error!(std::fs::metadata(path), ENOENT, reply);
+
+        debug!("{:?}", metadata);
+        let attr = fileattr_from(&metadata);
+        let ttl = Timespec::new(1, 0);
+        reply.attr(&ttl, &attr);
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         info!("lookup(parent={}, name={:?})", parent, name);
-        if parent == 1 {
-            let name = match name.to_str() {
-                Some(s) => s,
-                None => {
-                    error!("extracting name for lookup");
-                    reply.error(ENOENT);
-                    return;
-                }
-            };
-            let path = vec![self.backingpath.to_string(), name.to_string()].join("/");
-            match std::fs::metadata(path) {
-                Ok(metadata) => {
-                    debug!("{:?}", metadata);
-                    let attr = fileattr_from(&metadata);
-                    let ttl = Timespec::new(1, 0);
-                    debug!("warning: generation assumed 0");
-                    reply.entry(&ttl, &attr, 0);
-                    debug!("{:?}", attr);
-                }
-                Err(e) => {
-                    error!("{}: \"{}\"", e, name);
-                    reply.error(ENOENT);
-                }
-            };
-        } else {
-            reply.error(ENOSYS)
-        }
+
+        let parent_path = unwrap_or_return_error!(self.ino_paths.get(&parent),
+                                                  "ino not found in cache",
+                                                  ENOSYS,
+                                                  reply);
+
+        let file_name =
+            unwrap_or_return_error!(name.to_str(), "unable to read name", ENOSYS, reply);
+
+        let path = Path::new(&parent_path).join(file_name);
+        debug!("Path: {:?}", path);
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                debug!("{:?}", metadata);
+                let attr = fileattr_from(&metadata);
+                let ttl = Timespec::new(1, 0);
+                debug!("warning: generation assumed 0");
+                reply.entry(&ttl, &attr, 0);
+                debug!("{:?}", attr);
+            }
+            Err(e) => {
+                error!("{}", e);
+                reply.error(ENOENT);
+            }
+        };
     }
 
     fn readdir(&mut self,
@@ -137,40 +159,41 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
         info!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
         trace!("{:?}", _req);
 
-        if ino == 1 {
-            if offset == 0 {
-                reply.add(1, 0, fuse::FileType::Directory, ".");
-                reply.add(1, 1, fuse::FileType::Directory, "..");
-            }
+        let path = unwrap_or_return_error!(self.ino_paths.get(&ino),
+                                           "ino not found in cache",
+                                           ENOSYS,
+                                           reply)
+            .to_string();
 
-            let rd = match fs::read_dir(self.backingpath) {
-                Ok(rd) => rd,
-                Err(e) => {
-                    error!("{:?}", e);
-                    reply.error(ENOENT);
-                    return;
-                }
+        if offset == 0 {
+            reply.add(ino, 0, fuse::FileType::Directory, ".");
+            reply.add(ino, 1, fuse::FileType::Directory, "..");
+        }
+
+        let rd = ok_or_return_error!(fs::read_dir(path), ENOENT, reply);
+
+        for (i, entry_opt) in rd.enumerate() {
+            debug!("Found entry {}: {:?}", i, entry_opt);
+            if ((i + 2) as u64) < offset {
+                continue;
             };
-
-            for (i, entry_opt) in rd.enumerate() {
-                debug!("Found entry {}: {:?}", i, entry_opt);
-                if (i as u64) < offset {
-                    continue;
-                };
-                if let Ok(entry) = entry_opt {
-                    if let Ok(ft) = entry.file_type() {
-                        if let Ok(filetype) = filetype_tryfrom(&ft) {
-                            debug!("adding entry");
-                            if reply.add(entry.ino(), (i + 2) as u64, filetype, entry.file_name()) {
-                                break;
-                            }
+            if let Ok(entry) = entry_opt {
+                if let Ok(ft) = entry.file_type() {
+                    if let Ok(filetype) = filetype_tryfrom(&ft) {
+                        debug!("adding entry: {}, {}, {:?}, {:?}",
+                               entry.ino(),
+                               (i + 2) as u64,
+                               filetype,
+                               entry.file_name());
+                        if reply.add(entry.ino(), (i + 2) as u64, filetype, entry.file_name()) {
+                            debug!("out of space");
+                            break;
                         }
                     }
-                };
-            }
-            reply.ok();
-        } else {
-            reply.error(ENOSYS);
+                }
+            };
         }
+        debug!("returning stuff");
+        reply.ok();
     }
 }
