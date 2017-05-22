@@ -10,12 +10,12 @@ use std;
 use std::ffi::OsStr;
 use std::fs;
 use std::time::SystemTime;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct S3HierarchicalFilesystem<'a> {
     mount_path: &'a str,
     backing_path: &'a str,
-    ino_paths: std::collections::HashMap<u64, String>,
+    ino_paths: std::collections::HashMap<u64, PathBuf>,
 }
 
 impl<'a> S3HierarchicalFilesystem<'a> {
@@ -25,7 +25,7 @@ impl<'a> S3HierarchicalFilesystem<'a> {
             backing_path: bp,
             ino_paths: std::collections::HashMap::new(),
         };
-        fs.ino_paths.insert(1, bp.to_string());
+        fs.ino_paths.insert(1, PathBuf::from(bp));
         fuse::mount(fs, &mp, &[]).chain_err(|| "mounting filesystem")
     }
 }
@@ -74,6 +74,22 @@ fn fileattr_from(m: &std::fs::Metadata) -> FileAttr {
         rdev: m.rdev() as u32,
         flags: 0,
     }
+}
+
+fn dir_from(entry_opt: std::io::Result<fs::DirEntry>) -> Option<(u64, fuse::FileType, String)> {
+    use std::os::unix::fs::DirEntryExt;
+
+    let mut result = None;
+    if let Ok(entry) = entry_opt {
+        if let Ok(fsfiletype) = entry.file_type() {
+            if let Ok(filetype) = filetype_tryfrom(&fsfiletype) {
+                if let Ok(filename) = entry.file_name().into_string() {
+                    result = Some((entry.ino(), filetype, filename));
+                }
+            }
+        }
+    }
+    result
 }
 
 macro_rules! unwrap_or_return_error {
@@ -132,7 +148,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
 
         let path = Path::new(&parent_path).join(file_name);
         debug!("Path: {:?}", path);
-        match std::fs::metadata(path) {
+        match path.metadata() {
             Ok(metadata) => {
                 debug!("{:?}", metadata);
                 let attr = fileattr_from(&metadata);
@@ -142,7 +158,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                 debug!("{:?}", attr);
             }
             Err(e) => {
-                error!("{}", e);
+                info!("std::fs::metadata: {}", e);
                 reply.error(ENOENT);
             }
         };
@@ -154,46 +170,48 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                fh: u64,
                offset: u64,
                mut reply: ReplyDirectory) {
-        use std::os::unix::fs::DirEntryExt;
 
         info!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
         trace!("{:?}", _req);
 
-        let path = unwrap_or_return_error!(self.ino_paths.get(&ino),
-                                           "ino not found in cache",
-                                           ENOSYS,
-                                           reply)
-            .to_string();
+        let path = {
+            let x = unwrap_or_return_error!(self.ino_paths.get(&ino),
+                                            "ino not found in cache",
+                                            ENOSYS,
+                                            reply);
+            x.clone()
+        };
 
-        if offset == 0 {
+        if offset < 1 {
             reply.add(ino, 0, fuse::FileType::Directory, ".");
             reply.add(ino, 1, fuse::FileType::Directory, "..");
-        }
+        };
 
-        let rd = ok_or_return_error!(fs::read_dir(path), ENOENT, reply);
+        let rd = ok_or_return_error!(path.read_dir(), ENOENT, reply);
 
         for (i, entry_opt) in rd.enumerate() {
-            debug!("Found entry {}: {:?}", i, entry_opt);
-            if ((i + 2) as u64) < offset {
+            let entry_offset = (i + 2) as u64;
+            if offset >= entry_offset {
                 continue;
             };
-            if let Ok(entry) = entry_opt {
-                if let Ok(ft) = entry.file_type() {
-                    if let Ok(filetype) = filetype_tryfrom(&ft) {
-                        debug!("adding entry: {}, {}, {:?}, {:?}",
-                               entry.ino(),
-                               (i + 2) as u64,
-                               filetype,
-                               entry.file_name());
-                        if reply.add(entry.ino(), (i + 2) as u64, filetype, entry.file_name()) {
-                            debug!("out of space");
-                            break;
-                        }
-                    }
+            let (ino, filetype, filename) = match dir_from(entry_opt) {
+                Some(x) => x,
+                None => {
+                    error!("unable to extract directory entry");
+                    reply.error(ENOENT);
+                    return;
                 }
             };
+            debug!("Adding: {}, {}, {:?}, {}",
+                   ino,
+                   entry_offset,
+                   filetype,
+                   filename);
+            if reply.add(ino, entry_offset, filetype, &filename) {
+                break;
+            }
+            self.ino_paths.insert(ino, path.join(filename));
         }
-        debug!("returning stuff");
         reply.ok();
     }
 }
