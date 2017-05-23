@@ -1,7 +1,8 @@
 use super::errors::*;
 
 use fuse;
-use fuse::{Filesystem, Request, ReplyAttr, ReplyDirectory, ReplyEntry, FileAttr};
+use fuse::{Filesystem, Request, ReplyAttr, ReplyDirectory, ReplyEntry, FileAttr, ReplyOpen,
+           ReplyData, ReplyEmpty};
 
 use libc::{ENOSYS, ENOENT};
 
@@ -11,11 +12,14 @@ use std::ffi::OsStr;
 use std::fs;
 use std::time::SystemTime;
 use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::collections::HashMap;
 
 pub struct S3HierarchicalFilesystem<'a> {
     mount_path: &'a str,
     backing_path: &'a str,
-    ino_paths: std::collections::HashMap<u64, PathBuf>,
+    ino_paths: HashMap<u64, PathBuf>,
+    files: HashMap<u64, File>,
 }
 
 impl<'a> S3HierarchicalFilesystem<'a> {
@@ -23,7 +27,8 @@ impl<'a> S3HierarchicalFilesystem<'a> {
         let mut fs = S3HierarchicalFilesystem {
             mount_path: mp,
             backing_path: bp,
-            ino_paths: std::collections::HashMap::new(),
+            ino_paths: HashMap::new(),
+            files: HashMap::new(),
         };
         fs.ino_paths.insert(1, PathBuf::from(bp));
         fuse::mount(fs, &mp, &[]).chain_err(|| "mounting filesystem")
@@ -120,8 +125,7 @@ macro_rules! ok_or_return_error {
 
 impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        info!("getattr(ino={})", ino);
-        debug!("req: {:?}", _req);
+        trace!("getattr(ino={})", ino);
 
         let path = unwrap_or_return_error!(self.ino_paths.get(&ino),
                                            "ino not found in cache",
@@ -136,7 +140,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        info!("lookup(parent={}, name={:?})", parent, name);
+        trace!("lookup(parent={}, name={:?})", parent, name);
 
         let parent_path = unwrap_or_return_error!(self.ino_paths.get(&parent),
                                                   "ino not found in cache",
@@ -171,8 +175,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                offset: u64,
                mut reply: ReplyDirectory) {
 
-        info!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
-        trace!("{:?}", _req);
+        trace!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
 
         let path = {
             let x = unwrap_or_return_error!(self.ino_paths.get(&ino),
@@ -202,7 +205,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                     return;
                 }
             };
-            debug!("Adding: {}, {}, {:?}, {}",
+            debug!("Adding: {}, {}, {:?}, \"{}\"",
                    ino,
                    entry_offset,
                    filetype,
@@ -213,5 +216,94 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
             self.ino_paths.insert(ino, path.join(filename));
         }
         reply.ok();
+    }
+
+    fn open(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+        trace!("open(ino={}, flags={})", ino, _flags);
+
+        let path = {
+            let x = unwrap_or_return_error!(self.ino_paths.get(&ino),
+                                            "ino not found in cache",
+                                            ENOSYS,
+                                            reply);
+            x.clone()
+        };
+
+        // FIXME: race condition
+        let fh: u64 = *self.files.keys().max().unwrap_or(&10u64);
+        match File::open(path) {
+            Ok(f) => self.files.insert(fh, f),
+            Err(e) => {
+                error!("File::open: {:?}", e);
+                reply.error(e.raw_os_error().unwrap_or(ENOENT));
+                return;
+            }
+        };
+        trace!("opened file handle: {}", fh);
+        reply.opened(fh, 0);
+    }
+
+    fn read(&mut self,
+            _req: &Request,
+            _ino: u64,
+            fh: u64,
+            offset: u64,
+            size: u32,
+            reply: ReplyData) {
+
+        use std::io::Read;
+
+        trace!("read(ino={}, fh={}, offset={}, size={})",
+               _ino,
+               fh,
+               offset,
+               size);
+
+        let mut f = match self.files.get(&fh) {
+            Some(f) => f,
+            None => {
+                error!("File handle not found: {}", fh);
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        debug!("File: {:?}", f);
+        let mut buffer = Vec::with_capacity(size as usize);
+        buffer.resize(size as usize, 0u8);
+
+        match f.read_exact(&mut buffer[..]) {
+            Ok(n) => {
+                debug!("Read: {:?}", buffer);
+                reply.data(&buffer);
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(ENOENT)),
+        }
+    }
+
+    fn release(&mut self,
+               _req: &Request,
+               _ino: u64,
+               fh: u64,
+               _flags: u32,
+               _lock_owner: u64,
+               _flush: bool,
+               reply: ReplyEmpty) {
+        trace!("release(ino={}, fh={}, flags={}, lock_owner={}, flush={})",
+               _ino,
+               fh,
+               _flags,
+               _lock_owner,
+               _flush);
+
+        match self.files.remove(&fh) {
+            Some(_) => {
+                debug!("closed file handle: {}", fh);
+                reply.ok();
+            }
+            None => {
+                error!("File handle not found: {}", fh);
+                reply.error(ENOENT);
+            }
+        };
     }
 }
