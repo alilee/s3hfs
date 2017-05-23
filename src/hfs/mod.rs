@@ -2,7 +2,7 @@ use super::errors::*;
 
 use fuse;
 use fuse::{Filesystem, Request, ReplyAttr, ReplyDirectory, ReplyEntry, FileAttr, ReplyOpen,
-           ReplyData, ReplyEmpty, ReplyCreate};
+           ReplyData, ReplyEmpty, ReplyCreate, ReplyWrite};
 
 use libc::{ENOSYS, ENOENT};
 
@@ -357,5 +357,26 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                 reply.error(e.raw_os_error().unwrap_or(ENOENT));
             }
         }
+    }
+
+    fn write(&mut self,
+             _req: &Request,
+             _ino: u64,
+             _fh: u64,
+             _offset: u64,
+             _data: &[u8],
+             _flags: u32,
+             reply: ReplyWrite) {
+
+        // use std::io::Write;
+
+        trace!("write(ino={}, fh={}, offset={}, data={:?}, flags={})",
+               _ino,
+               _fh,
+               _offset,
+               _data,
+               _flags);
+
+        reply.error(ENOSYS);
     }
 }
