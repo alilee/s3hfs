@@ -2,7 +2,7 @@ use super::errors::*;
 
 use fuse;
 use fuse::{Filesystem, Request, ReplyAttr, ReplyDirectory, ReplyEntry, FileAttr, ReplyOpen,
-           ReplyData, ReplyEmpty};
+           ReplyData, ReplyEmpty, ReplyCreate};
 
 use libc::{ENOSYS, ENOENT};
 
@@ -16,8 +16,8 @@ use std::fs::File;
 use std::collections::HashMap;
 
 pub struct S3HierarchicalFilesystem<'a> {
-    mount_path: &'a str,
-    backing_path: &'a str,
+    _mount_path: &'a str,
+    _backing_path: &'a str,
     ino_paths: HashMap<u64, PathBuf>,
     files: HashMap<u64, File>,
 }
@@ -25,8 +25,8 @@ pub struct S3HierarchicalFilesystem<'a> {
 impl<'a> S3HierarchicalFilesystem<'a> {
     pub fn mount(mp: &str, bp: &str) -> Result<()> {
         let mut fs = S3HierarchicalFilesystem {
-            mount_path: mp,
-            backing_path: bp,
+            _mount_path: mp,
+            _backing_path: bp,
             ino_paths: HashMap::new(),
             files: HashMap::new(),
         };
@@ -229,18 +229,19 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
             x.clone()
         };
 
-        // FIXME: race condition
-        let fh: u64 = *self.files.keys().max().unwrap_or(&10u64);
         match File::open(path) {
-            Ok(f) => self.files.insert(fh, f),
+            Ok(f) => {
+                // FIXME: race condition
+                let fh: u64 = *self.files.keys().max().unwrap_or(&10u64);
+                self.files.insert(fh, f);
+                trace!("opened file handle: {}", fh);
+                reply.opened(fh, 0);
+            }
             Err(e) => {
                 error!("File::open: {:?}", e);
                 reply.error(e.raw_os_error().unwrap_or(ENOENT));
-                return;
             }
         };
-        trace!("opened file handle: {}", fh);
-        reply.opened(fh, 0);
     }
 
     fn read(&mut self,
@@ -272,7 +273,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
         buffer.resize(size as usize, 0u8);
 
         match f.read_exact(&mut buffer[..]) {
-            Ok(n) => {
+            Ok(_) => {
                 debug!("Read: {:?}", buffer);
                 reply.data(&buffer);
             }
@@ -305,5 +306,56 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                 reply.error(ENOENT);
             }
         };
+    }
+
+    fn create(&mut self,
+              _req: &Request,
+              parent: u64,
+              name: &OsStr,
+              _mode: u32,
+              _flags: u32,
+              reply: ReplyCreate) {
+        trace!("create(parent={}, name={:?}, mode={}, flags={})",
+               parent,
+               name,
+               _mode,
+               _flags);
+
+        let parent_path = {
+            let p = unwrap_or_return_error!(self.ino_paths.get(&parent),
+                                            "parent not found in cache",
+                                            ENOSYS,
+                                            reply);
+            p.clone()
+        };
+
+        let file_name =
+            unwrap_or_return_error!(name.to_str(), "unable to read name", ENOSYS, reply);
+
+        let path = Path::new(&parent_path).join(file_name);
+        debug!("Path: {:?}", &path);
+        match File::create(&path) {
+            Ok(f) => {
+                trace!("File created");
+                let fh: u64 = *self.files.keys().max().unwrap_or(&10u64);
+                self.files.insert(fh, f);
+                match path.metadata() {
+                    Ok(metadata) => {
+                        let attr = fileattr_from(&metadata);
+                        self.ino_paths.insert(attr.ino, path);
+                        let ttl = Timespec::new(1, 0);
+                        reply.created(&ttl, &attr, 0, fh, 0);
+                    }
+                    Err(e) => {
+                        error!("std::fs::metadata: {}", e);
+                        reply.error(e.raw_os_error().unwrap_or(ENOENT));
+                    }
+                }
+            }
+            Err(e) => {
+                error!("File::create: {:?}", e);
+                reply.error(e.raw_os_error().unwrap_or(ENOENT));
+            }
+        }
     }
 }
