@@ -97,13 +97,49 @@ fn dir_from(entry_opt: std::io::Result<fs::DirEntry>) -> Option<(u64, fuse::File
     result
 }
 
-macro_rules! unwrap_or_return_error {
-    ($v:expr, $log:expr, $err:expr, $reply:ident) => (
-        match $v {
-            Some(v) => v,
+macro_rules! ino_path_or_return {
+    ($self:ident, $parent:expr, $reply:ident) => ({
+        let path = match $self.ino_paths.get($parent) {
+            Some(p) => p,
             None => {
-                error!($log);
-                $reply.error($err);
+                error!("parent not found in cache");
+                $reply.error(ENOSYS);
+                return;
+            }
+        };
+        path.clone()
+    })
+}
+
+macro_rules! full_path_or_return {
+    ($self:ident, $parent:expr, $name:expr, $reply:ident) => ({
+        let parent_path = match $self.ino_paths.get($parent) {
+            Some(p) => p,
+            None => {
+                error!("parent not found in cache");
+                $reply.error(ENOSYS);
+                return;
+            }
+        };
+        let new_name = match $name.to_str() {
+            Some(p) => p,
+            None => {
+                error!("unable to read name");
+                $reply.error(ENOSYS);
+                return;
+            }
+        };
+        Path::new(&parent_path).join(new_name).clone()
+    })
+}
+
+macro_rules! file_handle_or_return {
+    ($self:ident, $fh:expr, $reply:ident) => (
+        match $self.files.get($fh) {
+            Some(f) => f,
+            None => {
+                error!("File handle not found: {}", $fh);
+                $reply.error(ENOENT);
                 return;
             }
         }
@@ -127,10 +163,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         trace!("getattr(ino={})", ino);
 
-        let path = unwrap_or_return_error!(self.ino_paths.get(&ino),
-                                           "ino not found in cache",
-                                           ENOENT,
-                                           reply);
+        let path = ino_path_or_return!(self, &ino, reply);
         let metadata = ok_or_return_error!(std::fs::metadata(path), ENOENT, reply);
 
         debug!("{:?}", metadata);
@@ -142,16 +175,8 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         trace!("lookup(parent={}, name={:?})", parent, name);
 
-        let parent_path = unwrap_or_return_error!(self.ino_paths.get(&parent),
-                                                  "ino not found in cache",
-                                                  ENOSYS,
-                                                  reply);
+        let path = full_path_or_return!(self, &parent, name, reply);
 
-        let file_name =
-            unwrap_or_return_error!(name.to_str(), "unable to read name", ENOSYS, reply);
-
-        let path = Path::new(&parent_path).join(file_name);
-        debug!("Path: {:?}", path);
         match path.metadata() {
             Ok(metadata) => {
                 debug!("{:?}", metadata);
@@ -177,13 +202,7 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
 
         trace!("readdir(ino={}, fh={}, offset={})", ino, fh, offset);
 
-        let path = {
-            let x = unwrap_or_return_error!(self.ino_paths.get(&ino),
-                                            "ino not found in cache",
-                                            ENOSYS,
-                                            reply);
-            x.clone()
-        };
+        let path: PathBuf = ino_path_or_return!(self, &ino, reply);
 
         if offset < 1 {
             reply.add(ino, 0, fuse::FileType::Directory, ".");
@@ -221,18 +240,12 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     fn open(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
         trace!("open(ino={}, flags={})", ino, _flags);
 
-        let path = {
-            let x = unwrap_or_return_error!(self.ino_paths.get(&ino),
-                                            "ino not found in cache",
-                                            ENOSYS,
-                                            reply);
-            x.clone()
-        };
+        let path = ino_path_or_return!(self, &ino, reply);
 
         match File::open(path) {
             Ok(f) => {
                 // FIXME: race condition
-                let fh: u64 = *self.files.keys().max().unwrap_or(&10u64);
+                let fh: u64 = *self.files.keys().max().unwrap_or(&10u64) + 1;
                 self.files.insert(fh, f);
                 trace!("opened file handle: {}", fh);
                 reply.opened(fh, 0);
@@ -260,21 +273,15 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                offset,
                size);
 
-        let mut f = match self.files.get(&fh) {
-            Some(f) => f,
-            None => {
-                error!("File handle not found: {}", fh);
-                reply.error(ENOENT);
-                return;
-            }
-        };
+        let mut f = file_handle_or_return!(self, &fh, reply);
         debug!("File: {:?}", f);
+
         let mut buffer = Vec::with_capacity(size as usize);
         buffer.resize(size as usize, 0u8);
 
         match f.read_exact(&mut buffer[..]) {
             Ok(_) => {
-                debug!("Read: {:?}", buffer);
+                debug!("Read {} bytes", size);
                 reply.data(&buffer);
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(ENOENT)),
@@ -321,23 +328,13 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
                _mode,
                _flags);
 
-        let parent_path = {
-            let p = unwrap_or_return_error!(self.ino_paths.get(&parent),
-                                            "parent not found in cache",
-                                            ENOSYS,
-                                            reply);
-            p.clone()
-        };
+        let path = full_path_or_return!(self, &parent, name, reply);
 
-        let file_name =
-            unwrap_or_return_error!(name.to_str(), "unable to read name", ENOSYS, reply);
-
-        let path = Path::new(&parent_path).join(file_name);
-        debug!("Path: {:?}", &path);
         match File::create(&path) {
             Ok(f) => {
-                trace!("File created");
-                let fh: u64 = *self.files.keys().max().unwrap_or(&10u64);
+                trace!("File created: {:?}", f);
+                let fh: u64 = *self.files.keys().max().unwrap_or(&10u64) + 1;
+                debug!("Handle: {}", fh);
                 self.files.insert(fh, f);
                 match path.metadata() {
                     Ok(metadata) => {
@@ -362,21 +359,61 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     fn write(&mut self,
              _req: &Request,
              _ino: u64,
-             _fh: u64,
-             _offset: u64,
-             _data: &[u8],
+             fh: u64,
+             offset: u64,
+             data: &[u8],
              _flags: u32,
              reply: ReplyWrite) {
 
-        // use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
 
         trace!("write(ino={}, fh={}, offset={}, data={:?}, flags={})",
                _ino,
-               _fh,
-               _offset,
-               _data,
+               fh,
+               offset,
+               data,
                _flags);
 
-        reply.error(ENOSYS);
+        let mut f = file_handle_or_return!(self, &fh, reply);
+        debug!("File: {:?}", f);
+
+        if let Err(e) = f.seek(SeekFrom::Start(offset)) {
+            error!("Unable to seek to position: {}", offset);
+            reply.error(e.raw_os_error().unwrap_or(ENOENT));
+            return;
+        }
+
+        match f.write(&data) {
+            Ok(size) => {
+                debug!("Written {} bytes", size);
+                reply.written(size as u32);
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(ENOENT)),
+        }
+    }
+
+    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {
+        trace!("mkdir(parent={}, name={:?}, mode={})", parent, name, _mode);
+
+        let path = full_path_or_return!(self, &parent, name, reply);
+
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                trace!("Subdir created");
+                match path.metadata() {
+                    Ok(metadata) => {
+                        let attr = fileattr_from(&metadata);
+                        self.ino_paths.insert(attr.ino, path);
+                        let ttl = Timespec::new(1, 0);
+                        reply.entry(&ttl, &attr, 0);
+                    }
+                    Err(e) => {
+                        error!("std::fs::metadata: {}", e);
+                        reply.error(e.raw_os_error().unwrap_or(ENOENT));
+                    }
+                }
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(ENOENT)),
+        }
     }
 }
