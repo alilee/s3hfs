@@ -487,4 +487,38 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
         let ttl = Timespec::new(1, 0);
         reply.attr(&ttl, &attr);
     }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        trace!("lookup(parent={}, name={:?})", parent, name);
+
+        let path = full_path_or_return!(self, &parent, name, reply);
+
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                debug!("Unlinked: {:?}", path);
+                reply.ok();
+            }
+            Err(e) => {
+                error!("fs::remove_file: {}", e);
+                reply.error(e.raw_os_error().unwrap_or(ENOENT));
+            }
+        };
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        trace!("rmdir(parent={}, name={:?})", parent, name);
+
+        let path = full_path_or_return!(self, &parent, name, reply);
+
+        match fs::remove_dir(&path) {
+            Ok(()) => {
+                debug!("Removed dir: {:?}", path);
+                reply.ok();
+            }
+            Err(e) => {
+                error!("fs::remove_dir: {}", e);
+                reply.error(e.raw_os_error().unwrap_or(ENOENT));
+            }
+        };
+    }
 }
