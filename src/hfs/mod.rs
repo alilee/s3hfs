@@ -159,6 +159,16 @@ macro_rules! ok_or_return_error {
     )
 }
 
+macro_rules! none_or_return_error {
+    ($v:expr, $reply:ident) => (
+        if $v.is_some() {
+            error!("setattr change not implemented: {:?}", $v);
+            $reply.error(ENOSYS);
+            return;
+        }
+    )
+}
+
 impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         trace!("getattr(ino={})", ino);
@@ -415,5 +425,66 @@ impl<'a> Filesystem for S3HierarchicalFilesystem<'a> {
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(ENOENT)),
         }
+    }
+
+    fn setattr(&mut self,
+               _req: &Request,
+               ino: u64,
+               mode: Option<u32>,
+               _uid: Option<u32>,
+               _gid: Option<u32>,
+               _size: Option<u64>,
+               _atime: Option<Timespec>,
+               _mtime: Option<Timespec>,
+               _fh: Option<u64>,
+               _crtime: Option<Timespec>,
+               _chgtime: Option<Timespec>,
+               _bkuptime: Option<Timespec>,
+               _flags: Option<u32>,
+               reply: ReplyAttr) {
+        trace!("setattr(ino={}, mode={:?}, uid={:?}, gid={:?}, size={:?}, atime={:?}, \
+                mtime={:?}, fh={:?}, crtime={:?}, chgtime={:?}, bkuptime={:?}, flags={:?})",
+               ino,
+               mode,
+               _uid,
+               _gid,
+               _size,
+               _atime,
+               _mtime,
+               _fh,
+               _crtime,
+               _chgtime,
+               _bkuptime,
+               _flags);
+
+        let path = ino_path_or_return!(self, &ino, reply);
+        let old_metadata = ok_or_return_error!(std::fs::metadata(&path), ENOENT, reply);
+        debug!("{:?}", old_metadata);
+
+        if let Some(new_mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            debug!("new_mode: {}", new_mode);
+            let mut perms = old_metadata.permissions();
+            perms.set_mode(new_mode);
+            if let Err(e) = fs::set_permissions(&path, perms) {
+                reply.error(e.raw_os_error().unwrap_or(ENOENT));
+                return;
+            }
+        }
+
+        none_or_return_error!(_uid, reply);
+        none_or_return_error!(_gid, reply);
+        none_or_return_error!(_size, reply);
+        none_or_return_error!(_atime, reply);
+        none_or_return_error!(_mtime, reply);
+        none_or_return_error!(_crtime, reply);
+        none_or_return_error!(_chgtime, reply);
+        none_or_return_error!(_bkuptime, reply);
+
+        let new_metadata = ok_or_return_error!(std::fs::metadata(&path), ENOENT, reply);
+        let attr = fileattr_from(&new_metadata);
+        debug!("{:?}", new_metadata);
+        let ttl = Timespec::new(1, 0);
+        reply.attr(&ttl, &attr);
     }
 }
